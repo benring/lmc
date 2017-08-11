@@ -49,7 +49,7 @@ One addtional note: you can always overwrite these values dynamically
 
 ## Master
 ###### ref: `lmc_joint_model.py`
-1. The master will build both the local and global graph. Note that for replication purposes, the master is the node which initializes and replicates all global graph data/ops to the workers. For local graphs, each node manages its own isolated data/ops. The master calls `manylmc.optimizeGlobal()` which is a wrapper around the actual logic, `lmc._sgd_Master()` which executes the global training loop.
+1. 
 
 
 ## Worker
@@ -57,8 +57,11 @@ TODO
 
 ## Synch & Async Policies
 ###### ref: `lmc_joint_model.py` Search: @synchpolicy  
-  
+
 The policies are defined via the program flag `FLAGS.synch_method`. They are processed by the master in `_sgd_master` and by the workers in `_sgd`. For the workers: the policy is mostly for logging purposes to ensure the log output reflects the correct timestep and to set the max # of iterations (for synch training). The master does pretty much all the the work.
+
+--> Note: The master will build both a local and the global graph. For replication purposes, the master is the node which initializes and replicates all global graph data/ops to the workers. For local graphs, each node manages its own isolated data/ops. The master calls `manylmc.optimizeGlobal()` which is a wrapper around the actual logic, `lmc._sgd_Master()` which executes the global training loop. This method is where the bulk of the sync/async policies are implemented.
+
 
 #### Asynchrony 
 * The actual asynchrony value to set is configurable via the program flag `synch_block_size`. This determines the # of gradients aggregated.  In addition, there is a flag for `asynch_max` which is the number of gradients accepted before aggregation (note: `asynch_max  >= synch_block_size `). This flag acts as a delay factor for the master to wait before applying gradients. 
@@ -73,11 +76,11 @@ For FIFO and synch policies `num_A = min_A` - setting the min_A any higher for t
 
 #### Gradient Processing
 * At the top of the main master loop (line ~3375), The master dequeu's 1 or more gradients to start its processing loop. We set a value for `max_accept` based on the gradient policy (lines 3140-3160), but, in general, the program will only process up to num_worker gradients at a time. This ensures it does not over-aggregate in the event of network latency when the queue may build up and it allows the master to relieve pressure by processing more gradients than the asynchrony value when the queue is very large.
-* The gradient TF queue is a tuple for worker, timestamp, the gradient. Each iteration of the loop, the master locally stores these in a the list `incoming` (line ~3385)
+* The gradient TF queue is a tuple for (worker, timestamp, gradient). Each iteration of the loop, the master locally stores these in a the list `incoming` (line ~3385)
 * For each grdient received, the master either accepts or rejects it (unless the worker flags that it is complete).
 * Master then takes the action based on the synch method (lines 3435~3460). This is where the master either stores it for processing in a TF aggregator variable (using the method `storeGrad`) or holds it in a python sortedList (`jacPQueue`) until its applied. Note that there is index (`jacCache`) into this list to facilitate processing. The sortedList is part of the python sortedcontainers package. The sorting function for each policy is defined as a lambda function (lines 3290-3300)
 * If a gradient decision is needed (line 3479), the actual parameter update is applied via the `applyGrad` call on line 3524. For the priority queue based policies (based on staleness or cosine distance), the master first prunes gradients, pops the top-A gradients, and then stores them in the TF aggregator variable.
---> NOTE: The sorting policies are managed on the python side since maintaining a sorted list is very difficult using TF ops.
+--> NOTE: The async sorting policies are managed in Python since maintaining a sorted list using TF ops is very difficult.
 
 #### Convergence & Termination
 * Termination is currently handled by stopping at a pre-determined number of iterations. For synch policy, each worker maintains a running count and stops when it reaches the `max_svi_iter` value. For the asynch policy, the master determines the total number of gradients and then flags the workers to stop training. This value is `num_workers X max_svi_iters` and is set up to be the same total gradients applied as compared to a synch policy. Note that the master will still process gradients until the workers report back that they have actually received the terminatin flag and have stopped their local logic (the flag is simply setting the timestamp to -1).
@@ -93,11 +96,52 @@ For FIFO and synch policies `num_A = min_A` - setting the min_A any higher for t
 * **wskew**: Experimental policy that weighted gradients based on the data skew of the workers.
 
 
-## Global Model
-
-## Local Model
-
 ## Data Interface
+###### ref: `tools/db.py`, `datainterface.py`
 
-## 
+There are two files to handle the data processing and I/O. The file, `db.py` (in the tools directory), was the original file and it was designed as a very light-weight self-contained wrapper around psycop2g. It's written so that you can import it as a standalone file into an interactive or jupyter session to help with analysis, processing or development.  The file, `datainterface.py` was written much later and is designed to serve as an abtraction layer in between the LMC program and the lower level database I/O. It's not a 100% clean separation but it should be much easier to integrate a new interface for a different dataset (it currently has interfaces for Mimic and CDM for both online and offline access).
 
+### `db.py`
+* Provides a wrapper class `db_conn` to handle database connections.  The connection strings to use SSL are included (but commented out). There are also predefined connection strings for the test/dev/prod databases on AWS.
+* This module maintains an active state for the current default connection via `db.DEF_CONN`. All functions/methods will use this connection string unless otherwise specfied.
+* Use `setDefaultDB()` to change this value
+* The methods, `adhoc()` and `runquery()` provide all the data I/O to run a single query. The second returns a result and the first does not. Note: these are designed for smaller queries (small as in input/output size).
+
+##### DDL & Tables
+The DDL is also defined in this file. I used a prefix in case there was ever a need to have two sets of the table or we wanted to coordinate the table names as part of a larger effort. For the most of these tables, there are pre-defined get/set methods (as needed) for data in/output. However, some of the I/O ops are found in the `datainterface.py` file.
+
+* **model** : Data for a trained model
+* **expr** : Data for an experiment or a single "training session." The model and experiment (and associated mid/eid) were designed to be separate in case we wanted to re-run training using the same model. However, this is no longer necessary and they can be combined.
+* **param_global** : The global parameters, retained at each step and stored as a BLOB.
+* **param_local** : For storing the local params for each patient's data. We never used this for training, but this is how you can checkpoint patients' local parameters for fault tolerance.
+* **metric** : Key-value table to store various metrics collected during training (these metrics mostly helped with the research experiments)
+* **score** : stores prediction output
+* **predict** : also store prediction output (but for Peter)
+* **kv** : A generic key-value table for storing json formatted data. All program flags for every experiement is stored in this table along with the shard lists for every dataset.
+* **numpy** : Generic key-value for storing numpy formatted data. Its primarily used to store intermediate node scores after prediction. The master pulls/aggregates all data and outputs results to the score table.
+* **mintsp** : stores min timestamp for all encounter ID's (by dataset). This is used to convert timestamp to time epochs used in LMC.
+
+
+### `datainterface.py`
+* Three high level abstractions:
+  1. Patient object
+  2. Feature definition
+  3. Data interface class <-- this is where most of the meat is found
+
+ ##### Feature Definition
+`FeatureDef` encapsulates and abstracts the feature logic into one convenient location. Currently, pre-determined features are hard-coded into the class (`feature_options` list).  The program flag, `feat_size` is literally an index into this list (items 0-3 are mimic and items 4-6 are CDM). The subclasses perform dataset specific pre-processing for the features to define the static/dense subsets and to put the features in a very specific order for the LMC model. This is also a placeholder for future expansion to create custom feature defs for different datasets or different tasks.
+
+ ##### Data Interface
+ * Abstract class for encapsulating all data logic between LMC and the database. It is designed to support both SQL and File-based I/O. 
+ * The object `self.data` holds the raw data loaded for the local node. 
+ * `self.data` was originally a pandas dataframe for mimic data. I later changed this to a numpy array. For the online prediction, I expanded the capability to make it a map {enc_id --> raw_data}. This allows the local node to more delete and add patients dynamically and is what is used in online_predicion.
+ * If you want to make this more memory efficient during training, you can delete the raw data object after the data is transformed to tensors.
+ * For CDM subclass: the `loadPatientData` is the call to actually invoke the dashan-db implemented connection to read in all the patient data. This is the one-and-only dependency on the dashad-db codebase. If you want to break this dependency, you can re-write this portion of the code.
+ * **Labels**. `loadLabelData` loads all the patient labels using match_patient_encounters stored procedure. The function, `applyLabelToData` using a simple lambda step function to assign a boolean label to every item in a patient's dataset. The LMC model is designed such that a patient is considered "positive" for all timestamp readings after the first diagnosis of sepsis (or septic shock).
+ * Active "state" for a patient is defined in the following objects:
+   * `self.data[encid]`  &rarr; Raw Data (the mapping is used for online prediction)
+   * `self.mintsp[encid]` &rarr; Min Timestamp. MIN of [admit_time, admission time, or first data reading] 
+   * `self.enc_tsp[encid]` &rarr; Last encounter timestamp -- used for delta query in online predicion
+   * `self.pt_map[encid]` &rarr; map to the patient object which holds the transformed data used to create the tensor objects as part of training. 
+   * `self.pt_tensor_map[encid]` &rarr; Added later and used in online prediction. This is a mapping to the tensor objects. This is a much more efficient way to manage the tensors to pass into the TF graph. If you want to refactor the training side to use this, you can.
+* The `removePatients` method is designed to accept a current list of active patients. It compares that list with the raw patient data list in cache and delete the difference.
